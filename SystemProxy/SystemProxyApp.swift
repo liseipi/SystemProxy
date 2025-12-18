@@ -6,12 +6,15 @@ import Security
 // MARK: - 代理配置模型
 struct ProxyConfiguration: Codable {
     var proxyHost: String
-    var proxyPort: String
+    var httpPort: String
+    var httpsPort: String
+    var socks5Port: String
     var isEnabled: Bool
-    var proxyType: ProxyType
+    var enabledTypes: Set<ProxyType>
     var networkInterface: String
+    var bypassDomains: String
     
-    enum ProxyType: String, Codable, CaseIterable {
+    enum ProxyType: String, Codable, CaseIterable, Hashable {
         case http = "HTTP"
         case https = "HTTPS"
         case socks5 = "SOCKS5"
@@ -31,10 +34,13 @@ class ProxyManager: ObservableObject {
     init() {
         self.configuration = ProxyConfiguration(
             proxyHost: "127.0.0.1",
-            proxyPort: "1080",
+            httpPort: "7890",
+            httpsPort: "7890",
+            socks5Port: "7891",
             isEnabled: false,
-            proxyType: .http,
-            networkInterface: "Wi-Fi"
+            enabledTypes: [.http, .https, .socks5],
+            networkInterface: "Wi-Fi",
+            bypassDomains: "127.0.0.1, localhost, *.local, 192.168.0.0/16, 10.0.0.0/8"
         )
         self.statusMessage = "代理未启用"
         self.isLoading = false
@@ -98,93 +104,162 @@ class ProxyManager: ObservableObject {
         executeProxyCommands(enabled: false)
     }
     
-    // 使用 Process 和 AuthorizationExecuteWithPrivileges 的替代方案
+    // 转义 AppleScript 字符串
+    private func escapeForAppleScript(_ str: String) -> String {
+        return str
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+    
+    // 执行多个命令（只需要一次授权）
+    private func executeCommands(_ commands: [(cmd: String, args: [String], description: String)]) -> (success: Bool, error: String?, failedStep: String?) {
+        // 构建所有命令的 shell 脚本
+        var shellCommands: [String] = []
+        
+        for (cmd, args, description) in commands {
+            let escapedArgs = args.map { arg in
+                // 对参数进行适当的引号处理
+                if arg.contains(" ") {
+                    return "'\(arg)'"
+                }
+                return arg
+            }
+            let fullCommand = "\(cmd) \(escapedArgs.joined(separator: " "))"
+            shellCommands.append(fullCommand)
+            print("准备执行: \(description) - \(fullCommand)")
+        }
+        
+        // 用分号连接所有命令
+        let combinedScript = shellCommands.joined(separator: "; ")
+        
+        let script = """
+        do shell script "\(escapeForAppleScript(combinedScript))" with administrator privileges
+        """
+        
+        print("\n完整脚本:\n\(combinedScript)\n")
+        
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: script) {
+            let result = scriptObject.executeAndReturnError(&error)
+            
+            if let error = error {
+                let errorCode = error["NSAppleScriptErrorNumber"] as? Int ?? 0
+                let errorMessage = error["NSAppleScriptErrorMessage"] as? String ?? "未知错误"
+                print("命令执行失败")
+                print("错误码: \(errorCode), 错误信息: \(errorMessage)")
+                
+                if errorCode == -128 {
+                    return (false, "用户取消了操作", nil)
+                } else if errorCode == -2825 {
+                    return (false, "需要管理员权限", nil)
+                } else {
+                    return (false, "错误 (\(errorCode)): \(errorMessage)", nil)
+                }
+            } else {
+                print("所有命令执行成功")
+                if let resultString = result.stringValue, !resultString.isEmpty {
+                    print("结果: \(resultString)")
+                }
+                return (true, nil, nil)
+            }
+        }
+        
+        return (false, "无法创建 AppleScript", nil)
+    }
+    
     private func executeProxyCommands(enabled: Bool) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            let commands: [(cmd: String, args: [String])]
+            var commands: [(cmd: String, args: [String], description: String)] = []
             
             if enabled {
-                switch self.configuration.proxyType {
-                case .http:
-                    commands = [
-                        ("/usr/sbin/networksetup", ["-setwebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.proxyPort]),
-                        ("/usr/sbin/networksetup", ["-setwebproxystate", self.configuration.networkInterface, "on"])
-                    ]
-                case .https:
-                    commands = [
-                        ("/usr/sbin/networksetup", ["-setsecurewebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.proxyPort]),
-                        ("/usr/sbin/networksetup", ["-setsecurewebproxystate", self.configuration.networkInterface, "on"])
-                    ]
-                case .socks5:
-                    commands = [
-                        ("/usr/sbin/networksetup", ["-setsocksfirewallproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.proxyPort]),
-                        ("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", self.configuration.networkInterface, "on"])
-                    ]
+                // HTTP 代理
+                if self.configuration.enabledTypes.contains(.http) {
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setwebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.httpPort],
+                                   description: "设置 HTTP 代理"))
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setwebproxystate", self.configuration.networkInterface, "on"],
+                                   description: "启用 HTTP 代理"))
+                    // 设置绕过列表
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setproxybypassdomains", self.configuration.networkInterface] + self.configuration.bypassDomains.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) },
+                                   description: "设置代理绕过列表"))
+                }
+                
+                // HTTPS 代理
+                if self.configuration.enabledTypes.contains(.https) {
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setsecurewebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.httpsPort],
+                                   description: "设置 HTTPS 代理"))
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setsecurewebproxystate", self.configuration.networkInterface, "on"],
+                                   description: "启用 HTTPS 代理"))
+                }
+                
+                // SOCKS5 代理
+                if self.configuration.enabledTypes.contains(.socks5) {
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setsocksfirewallproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.socks5Port],
+                                   description: "设置 SOCKS5 代理"))
+                    commands.append((cmd: "/usr/sbin/networksetup",
+                                   args: ["-setsocksfirewallproxystate", self.configuration.networkInterface, "on"],
+                                   description: "启用 SOCKS5 代理"))
                 }
             } else {
+                // 禁用所有代理类型
                 commands = [
-                    ("/usr/sbin/networksetup", ["-setwebproxystate", self.configuration.networkInterface, "off"]),
-                    ("/usr/sbin/networksetup", ["-setsecurewebproxystate", self.configuration.networkInterface, "off"]),
-                    ("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", self.configuration.networkInterface, "off"])
+                    (cmd: "/usr/sbin/networksetup",
+                     args: ["-setwebproxystate", self.configuration.networkInterface, "off"],
+                     description: "禁用 HTTP 代理"),
+                    (cmd: "/usr/sbin/networksetup",
+                     args: ["-setsecurewebproxystate", self.configuration.networkInterface, "off"],
+                     description: "禁用 HTTPS 代理"),
+                    (cmd: "/usr/sbin/networksetup",
+                     args: ["-setsocksfirewallproxystate", self.configuration.networkInterface, "off"],
+                     description: "禁用 SOCKS5 代理")
                 ]
             }
             
-            // 使用 AppleScript 执行命令
             var allSuccess = true
-            for (cmd, args) in commands {
-                let argString = args.map { "\"\($0)\"" }.joined(separator: " ")
-                let fullCommand = "\(cmd) \(argString)"
+            var failedStep = ""
+            
+            // 一次性执行所有命令
+            let result = self.executeCommands(commands)
+            
+            if !result.success {
+                allSuccess = false
+                failedStep = result.failedStep ?? "未知步骤"
                 
-                let script = """
-                do shell script "\(fullCommand)" with administrator privileges
-                """
-                
-                var error: NSDictionary?
-                if let scriptObject = NSAppleScript(source: script) {
-                    let result = scriptObject.executeAndReturnError(&error)
-                    
-                    if let error = error {
-                        print("命令执行失败: \(fullCommand)")
-                        print("错误: \(error)")
-                        allSuccess = false
-                        
-                        DispatchQueue.main.async {
-                            let errorCode = error["NSAppleScriptErrorNumber"] as? Int ?? 0
-                            let errorMessage = error["NSAppleScriptErrorMessage"] as? String ?? "未知错误"
-                            
-                            if errorCode == -128 {
-                                self.statusMessage = "⚠️ 操作已取消"
-                            } else if errorCode == -2825 {
-                                self.statusMessage = "⚠️ 需要管理员权限,请在弹出的对话框中输入密码"
-                            } else {
-                                self.statusMessage = "❌ 错误 (\(errorCode)): \(errorMessage)"
-                            }
-                        }
-                        break
-                    } else {
-                        print("命令执行成功: \(fullCommand)")
-                        if let resultString = result.stringValue {
-                            print("结果: \(resultString)")
-                        }
-                    }
-                } else {
-                    allSuccess = false
-                    break
+                DispatchQueue.main.async {
+                    self.statusMessage = "❌ 执行失败: \(result.error ?? "未知错误")"
+                    self.isLoading = false
+                    self.configuration.isEnabled = false
                 }
+                return
             }
             
             DispatchQueue.main.async {
                 self.isLoading = false
                 if allSuccess {
                     self.configuration.isEnabled = enabled
-                    self.statusMessage = enabled ?
-                        "✅ 代理已启用 - \(self.configuration.proxyType.rawValue) \(self.configuration.proxyHost):\(self.configuration.proxyPort)" :
-                        "✅ 代理已禁用"
+                    if enabled {
+                        var parts: [String] = []
+                        if self.configuration.enabledTypes.contains(.http) {
+                            parts.append("HTTP:\(self.configuration.httpPort)")
+                        }
+                        if self.configuration.enabledTypes.contains(.https) {
+                            parts.append("HTTPS:\(self.configuration.httpsPort)")
+                        }
+                        if self.configuration.enabledTypes.contains(.socks5) {
+                            parts.append("SOCKS5:\(self.configuration.socks5Port)")
+                        }
+                        self.statusMessage = "✅ 代理已启用 - \(parts.joined(separator: ", "))"
+                    } else {
+                        self.statusMessage = "✅ 代理已禁用"
+                    }
                     self.saveConfiguration()
-                } else {
-                    self.configuration.isEnabled = false
                 }
             }
         }
@@ -196,48 +271,71 @@ class ProxyManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            let task = Process()
-            task.launchPath = "/usr/sbin/networksetup"
-            task.arguments = ["-getwebproxy", self.configuration.networkInterface]
+            var statusParts: [String] = []
             
-            let pipe = Pipe()
-            task.standardOutput = pipe
+            // 检查 HTTP 代理
+            if let httpStatus = self.getProxyStatus(type: "webproxy") {
+                statusParts.append(httpStatus)
+            }
             
-            do {
-                try task.run()
-                task.waitUntilExit()
-                
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let output = String(data: data, encoding: .utf8) {
-                    let isEnabled = output.contains("Enabled: Yes")
-                    
-                    DispatchQueue.main.async {
-                        if isEnabled {
-                            // 提取服务器和端口信息
-                            let lines = output.components(separatedBy: "\n")
-                            var server = ""
-                            var port = ""
-                            
-                            for line in lines {
-                                if line.contains("Server:") {
-                                    server = line.replacingOccurrences(of: "Server:", with: "").trimmingCharacters(in: .whitespaces)
-                                } else if line.contains("Port:") {
-                                    port = line.replacingOccurrences(of: "Port:", with: "").trimmingCharacters(in: .whitespaces)
-                                }
-                            }
-                            
-                            self.statusMessage = "✅ 代理已启用 - \(server):\(port)"
-                        } else {
-                            self.statusMessage = "⚪️ 代理当前未启用"
-                        }
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.statusMessage = "❌ 无法检查代理状态"
+            // 检查 HTTPS 代理
+            if let httpsStatus = self.getProxyStatus(type: "securewebproxy") {
+                statusParts.append(httpsStatus)
+            }
+            
+            // 检查 SOCKS5 代理
+            if let socksStatus = self.getProxyStatus(type: "socksfirewallproxy") {
+                statusParts.append(socksStatus)
+            }
+            
+            DispatchQueue.main.async {
+                if statusParts.isEmpty {
+                    self.statusMessage = "⚪️ 所有代理均未启用"
+                    self.configuration.isEnabled = false
+                } else {
+                    self.statusMessage = "✅ 已启用: \(statusParts.joined(separator: ", "))"
+                    self.configuration.isEnabled = true
                 }
             }
         }
+    }
+    
+    private func getProxyStatus(type: String) -> String? {
+        let task = Process()
+        task.launchPath = "/usr/sbin/networksetup"
+        task.arguments = ["-get\(type)", self.configuration.networkInterface]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                if output.contains("Enabled: Yes") {
+                    let lines = output.components(separatedBy: "\n")
+                    var server = ""
+                    var port = ""
+                    
+                    for line in lines {
+                        if line.contains("Server:") {
+                            server = line.replacingOccurrences(of: "Server:", with: "").trimmingCharacters(in: .whitespaces)
+                        } else if line.contains("Port:") {
+                            port = line.replacingOccurrences(of: "Port:", with: "").trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                    
+                    let typeName = type == "webproxy" ? "HTTP" : (type == "securewebproxy" ? "HTTPS" : "SOCKS5")
+                    return "\(typeName) \(server):\(port)"
+                }
+            }
+        } catch {
+            print("检查 \(type) 状态失败: \(error)")
+        }
+        
+        return nil
     }
     
     func testProxy() {
@@ -254,24 +352,18 @@ class ProxyManager: ObservableObject {
         
         var proxyDict: [String: Any] = [:]
         
-        switch configuration.proxyType {
-        case .http:
+        // 如果启用了 HTTP，使用 HTTP 代理测试
+        if configuration.enabledTypes.contains(.http) {
             proxyDict = [
                 kCFNetworkProxiesHTTPEnable as String: 1,
                 kCFNetworkProxiesHTTPProxy as String: configuration.proxyHost,
-                kCFNetworkProxiesHTTPPort as String: Int(configuration.proxyPort) ?? 1080
+                kCFNetworkProxiesHTTPPort as String: Int(configuration.httpPort) ?? 7890
             ]
-        case .https:
-            proxyDict = [
-                kCFNetworkProxiesHTTPSEnable as String: 1,
-                kCFNetworkProxiesHTTPSProxy as String: configuration.proxyHost,
-                kCFNetworkProxiesHTTPSPort as String: Int(configuration.proxyPort) ?? 1080
-            ]
-        case .socks5:
+        } else if configuration.enabledTypes.contains(.socks5) {
             proxyDict = [
                 kCFNetworkProxiesSOCKSEnable as String: 1,
                 kCFNetworkProxiesSOCKSProxy as String: configuration.proxyHost,
-                kCFNetworkProxiesSOCKSPort as String: Int(configuration.proxyPort) ?? 1080
+                kCFNetworkProxiesSOCKSPort as String: Int(configuration.socks5Port) ?? 7891
             ]
         }
         
@@ -343,34 +435,113 @@ struct ContentView: View {
                 Text("代理类型")
                     .font(.headline)
                 
-                Picker("", selection: $proxyManager.configuration.proxyType) {
+                HStack(spacing: 15) {
                     ForEach(ProxyConfiguration.ProxyType.allCases, id: \.self) { type in
-                        Text(type.rawValue).tag(type)
+                        Toggle(isOn: Binding(
+                            get: { proxyManager.configuration.enabledTypes.contains(type) },
+                            set: { isEnabled in
+                                if isEnabled {
+                                    proxyManager.configuration.enabledTypes.insert(type)
+                                } else {
+                                    proxyManager.configuration.enabledTypes.remove(type)
+                                }
+                                proxyManager.saveConfiguration()
+                            }
+                        )) {
+                            Text(type.rawValue)
+                                .font(.subheadline)
+                        }
+                        .toggleStyle(.checkbox)
+                        .disabled(proxyManager.configuration.isEnabled)
                     }
                 }
-                .pickerStyle(SegmentedPickerStyle())
-                .disabled(proxyManager.configuration.isEnabled)
             }
             .padding(.horizontal)
             
             // 代理服务器配置
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 12) {
                 Text("代理服务器")
                     .font(.headline)
                 
+                // 主机地址
                 HStack {
+                    Text("主机:")
+                        .frame(width: 80, alignment: .leading)
                     TextField("IP 地址", text: $proxyManager.configuration.proxyHost)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                         .disabled(proxyManager.configuration.isEnabled)
-                    
-                    Text(":")
-                        .font(.title3)
-                    
-                    TextField("端口", text: $proxyManager.configuration.proxyPort)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                        .frame(width: 80)
-                        .disabled(proxyManager.configuration.isEnabled)
                 }
+                
+                // HTTP 端口
+                if proxyManager.configuration.enabledTypes.contains(.http) {
+                    HStack {
+                        Text("HTTP 端口:")
+                            .frame(width: 80, alignment: .leading)
+                        TextField("端口", text: $proxyManager.configuration.httpPort)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .frame(width: 100)
+                            .disabled(proxyManager.configuration.isEnabled)
+                        Spacer()
+                    }
+                }
+                
+                // HTTPS 端口
+                if proxyManager.configuration.enabledTypes.contains(.https) {
+                    HStack {
+                        Text("HTTPS 端口:")
+                            .frame(width: 80, alignment: .leading)
+                        TextField("端口", text: $proxyManager.configuration.httpsPort)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .frame(width: 100)
+                            .disabled(proxyManager.configuration.isEnabled)
+                        Spacer()
+                    }
+                }
+                
+                // SOCKS5 端口
+                if proxyManager.configuration.enabledTypes.contains(.socks5) {
+                    HStack {
+                        Text("SOCKS5 端口:")
+                            .frame(width: 80, alignment: .leading)
+                        TextField("端口", text: $proxyManager.configuration.socks5Port)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .frame(width: 100)
+                            .disabled(proxyManager.configuration.isEnabled)
+                        Spacer()
+                    }
+                }
+            }
+            .padding(.horizontal)
+            
+            // 代理绕过列表
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("绕过代理的地址")
+                        .font(.headline)
+                    
+                    Button(action: {}) {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.blue)
+                    }
+                    .buttonStyle(.plain)
+                    .help("这些地址将直接连接，不通过代理。防止代理软件自身进入死循环。")
+                }
+                
+                TextEditor(text: $proxyManager.configuration.bypassDomains)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(height: 60)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                    )
+                    .disabled(proxyManager.configuration.isEnabled)
+                    .onChange(of: proxyManager.configuration.bypassDomains) { _, _ in
+                        proxyManager.saveConfiguration()
+                    }
+                
+                Text("多个地址用逗号分隔，支持通配符 (如 *.local) 和 CIDR (如 192.168.0.0/16)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
             .padding(.horizontal)
             
@@ -414,7 +585,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(proxyManager.configuration.isEnabled ? .red : .green)
-                .disabled(proxyManager.isLoading)
+                .disabled(proxyManager.isLoading || proxyManager.configuration.enabledTypes.isEmpty)
                 
                 Button(action: {
                     proxyManager.checkProxyStatus()
@@ -460,15 +631,22 @@ struct ContentView: View {
                 .background(Color.orange.opacity(0.15))
                 .cornerRadius(8)
                 
-                Label("代理将应用于整个系统的所有网络连接", systemImage: "info.circle")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .foregroundColor(.green)
+                    Text("本地地址已自动绕过，避免代理软件死循环")
+                        .font(.caption)
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .background(Color.green.opacity(0.1))
+                .cornerRadius(8)
             }
             .padding(.horizontal)
             
             Spacer()
         }
-        .frame(width: 480, height: 580)
+        .frame(width: 480, height: 720)
         .padding()
     }
 }
@@ -492,18 +670,24 @@ struct HelpView: View {
                 
                 HelpItem(
                     icon: "2.circle.fill",
-                    title: "配置代理信息",
-                    description: "填写代理服务器的 IP 地址和端口,通常本地代理使用 127.0.0.1"
+                    title: "选择代理类型",
+                    description: "可以同时勾选 HTTP、HTTPS 和 SOCKS5，它们可以使用不同的端口"
                 )
                 
                 HelpItem(
                     icon: "3.circle.fill",
+                    title: "配置代理信息",
+                    description: "填写代理服务器的 IP 地址和各类型的端口号。例如：Clash 通常 HTTP/HTTPS 用 7890，SOCKS5 用 7891"
+                )
+                
+                HelpItem(
+                    icon: "4.circle.fill",
                     title: "选择网络接口",
                     description: "Wi-Fi 用于无线连接,以太网用于有线连接"
                 )
                 
                 HelpItem(
-                    icon: "4.circle.fill",
+                    icon: "5.circle.fill",
                     title: "输入管理员密码",
                     description: "点击启动代理时会弹出密码对话框,输入你的 Mac 登录密码"
                 )
@@ -514,6 +698,40 @@ struct HelpView: View {
                     description: "启动代理后,可以点击测试连接按钮验证代理是否正常工作"
                 )
             }
+            
+            Divider()
+            
+            Text("常见配置")
+                .font(.headline)
+            
+            Text("• Clash: HTTP/HTTPS 端口 7890，SOCKS5 端口 7891")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Text("• V2Ray: 通常使用 SOCKS5，端口 1080")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Text("• Shadowrocket: 根据配置，通常 HTTP 1087，SOCKS5 1086")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Divider()
+            
+            Text("绕过列表说明")
+                .font(.headline)
+            
+            Text("• 默认已包含本地地址，防止代理软件死循环")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Text("• 如需添加其他地址，用逗号分隔")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Text("• 例如：127.0.0.1, localhost, *.apple.com, 192.168.0.0/16")
+                .font(.caption)
+                .foregroundColor(.secondary)
             
             Divider()
             
@@ -533,7 +751,7 @@ struct HelpView: View {
                 .foregroundColor(.secondary)
         }
         .padding()
-        .frame(width: 400)
+        .frame(width: 420)
     }
 }
 
