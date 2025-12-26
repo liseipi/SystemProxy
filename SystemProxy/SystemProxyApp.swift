@@ -27,9 +27,11 @@ class ProxyManager: ObservableObject {
     @Published var statusMessage: String
     @Published var isLoading: Bool
     @Published var networkInterfaces: [String] = []
+    @Published var isHelperInstalled: Bool = false
     
     private let defaults = UserDefaults.standard
     private let configKey = "ProxyConfiguration"
+    private let helperPath = "/usr/local/bin/systemproxy-helper"
     
     init() {
         self.configuration = ProxyConfiguration(
@@ -47,6 +49,79 @@ class ProxyManager: ObservableObject {
         
         loadNetworkInterfaces()
         loadConfiguration()
+        checkHelperInstallation()
+    }
+    
+    // 检查辅助脚本是否已安装
+    func checkHelperInstallation() {
+        let fileManager = FileManager.default
+        isHelperInstalled = fileManager.fileExists(atPath: helperPath) && fileManager.isExecutableFile(atPath: helperPath)
+    }
+    
+    // 安装辅助脚本（只需一次密码）
+    func installHelper() {
+        isLoading = true
+        statusMessage = "正在安装辅助工具..."
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            // 创建辅助脚本内容
+            let helperScript = """
+            #!/bin/bash
+            # SystemProxy Helper Script
+            # This script runs networksetup commands with elevated privileges
+            
+            if [ "$#" -lt 2 ]; then
+                echo "Usage: $0 <command> <args...>"
+                exit 1
+            fi
+            
+            /usr/sbin/networksetup "$@"
+            """
+            
+            // 使用 AppleScript 一次性安装脚本
+            let script = """
+            do shell script "echo '\(self.escapeForAppleScript(helperScript))' | sudo tee \(helperPath) > /dev/null && sudo chmod +x \(helperPath)" with administrator privileges
+            """
+            
+            var error: NSDictionary?
+            if let scriptObject = NSAppleScript(source: script) {
+                let result = scriptObject.executeAndReturnError(&error)
+                
+                DispatchQueue.main.async {
+                    if let error = error {
+                        let errorCode = error["NSAppleScriptErrorNumber"] as? Int ?? 0
+                        if errorCode == -128 {
+                            self.statusMessage = "❌ 用户取消了安装"
+                        } else {
+                            self.statusMessage = "❌ 安装失败"
+                        }
+                        self.isLoading = false
+                    } else {
+                        self.isHelperInstalled = true
+                        self.statusMessage = "✅ 辅助工具安装成功！现在可以无需密码切换代理"
+                        self.isLoading = false
+                    }
+                }
+            }
+        }
+    }
+    
+    // 卸载辅助脚本
+    func uninstallHelper() {
+        let script = """
+        do shell script "sudo rm -f \(helperPath)" with administrator privileges
+        """
+        
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: script) {
+            scriptObject.executeAndReturnError(&error)
+            if error == nil {
+                isHelperInstalled = false
+                statusMessage = "✅ 辅助工具已卸载"
+            }
+        }
     }
     
     // 加载网络接口列表
@@ -109,135 +184,81 @@ class ProxyManager: ObservableObject {
         return str
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\n", with: "\\n")
     }
     
-    // 执行多个命令（只需要一次授权）
-    private func executeCommands(_ commands: [(cmd: String, args: [String], description: String)]) -> (success: Bool, error: String?, failedStep: String?) {
-        // 构建所有命令的 shell 脚本
-        var shellCommands: [String] = []
+    // 使用辅助脚本执行命令（无需密码）
+    private func executeWithHelper(_ args: [String]) -> Bool {
+        let task = Process()
+        task.launchPath = helperPath
+        task.arguments = args
         
-        for (cmd, args, description) in commands {
-            let escapedArgs = args.map { arg in
-                // 对参数进行适当的引号处理
-                if arg.contains(" ") {
-                    return "'\(arg)'"
-                }
-                return arg
-            }
-            let fullCommand = "\(cmd) \(escapedArgs.joined(separator: " "))"
-            shellCommands.append(fullCommand)
-            print("准备执行: \(description) - \(fullCommand)")
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            print("执行失败: \(error)")
+            return false
         }
-        
-        // 用分号连接所有命令
-        let combinedScript = shellCommands.joined(separator: "; ")
-        
-        let script = """
-        do shell script "\(escapeForAppleScript(combinedScript))" with administrator privileges
-        """
-        
-        print("\n完整脚本:\n\(combinedScript)\n")
-        
-        var error: NSDictionary?
-        if let scriptObject = NSAppleScript(source: script) {
-            let result = scriptObject.executeAndReturnError(&error)
-            
-            if let error = error {
-                let errorCode = error["NSAppleScriptErrorNumber"] as? Int ?? 0
-                let errorMessage = error["NSAppleScriptErrorMessage"] as? String ?? "未知错误"
-                print("命令执行失败")
-                print("错误码: \(errorCode), 错误信息: \(errorMessage)")
-                
-                if errorCode == -128 {
-                    return (false, "用户取消了操作", nil)
-                } else if errorCode == -2825 {
-                    return (false, "需要管理员权限", nil)
-                } else {
-                    return (false, "错误 (\(errorCode)): \(errorMessage)", nil)
-                }
-            } else {
-                print("所有命令执行成功")
-                if let resultString = result.stringValue, !resultString.isEmpty {
-                    print("结果: \(resultString)")
-                }
-                return (true, nil, nil)
-            }
-        }
-        
-        return (false, "无法创建 AppleScript", nil)
     }
     
+    // 执行代理命令
     private func executeProxyCommands(enabled: Bool) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            var commands: [(cmd: String, args: [String], description: String)] = []
+            var commands: [[String]] = []
             
             if enabled {
                 // HTTP 代理
                 if self.configuration.enabledTypes.contains(.http) {
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setwebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.httpPort],
-                                   description: "设置 HTTP 代理"))
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setwebproxystate", self.configuration.networkInterface, "on"],
-                                   description: "启用 HTTP 代理"))
-                    // 设置绕过列表
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setproxybypassdomains", self.configuration.networkInterface] + self.configuration.bypassDomains.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) },
-                                   description: "设置代理绕过列表"))
+                    commands.append(["-setwebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.httpPort])
+                    commands.append(["-setwebproxystate", self.configuration.networkInterface, "on"])
+                    
+                    let bypassList = self.configuration.bypassDomains.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                    commands.append(["-setproxybypassdomains", self.configuration.networkInterface] + bypassList)
                 }
                 
                 // HTTPS 代理
                 if self.configuration.enabledTypes.contains(.https) {
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setsecurewebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.httpsPort],
-                                   description: "设置 HTTPS 代理"))
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setsecurewebproxystate", self.configuration.networkInterface, "on"],
-                                   description: "启用 HTTPS 代理"))
+                    commands.append(["-setsecurewebproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.httpsPort])
+                    commands.append(["-setsecurewebproxystate", self.configuration.networkInterface, "on"])
                 }
                 
                 // SOCKS5 代理
                 if self.configuration.enabledTypes.contains(.socks5) {
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setsocksfirewallproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.socks5Port],
-                                   description: "设置 SOCKS5 代理"))
-                    commands.append((cmd: "/usr/sbin/networksetup",
-                                   args: ["-setsocksfirewallproxystate", self.configuration.networkInterface, "on"],
-                                   description: "启用 SOCKS5 代理"))
+                    commands.append(["-setsocksfirewallproxy", self.configuration.networkInterface, self.configuration.proxyHost, self.configuration.socks5Port])
+                    commands.append(["-setsocksfirewallproxystate", self.configuration.networkInterface, "on"])
                 }
             } else {
                 // 禁用所有代理类型
                 commands = [
-                    (cmd: "/usr/sbin/networksetup",
-                     args: ["-setwebproxystate", self.configuration.networkInterface, "off"],
-                     description: "禁用 HTTP 代理"),
-                    (cmd: "/usr/sbin/networksetup",
-                     args: ["-setsecurewebproxystate", self.configuration.networkInterface, "off"],
-                     description: "禁用 HTTPS 代理"),
-                    (cmd: "/usr/sbin/networksetup",
-                     args: ["-setsocksfirewallproxystate", self.configuration.networkInterface, "off"],
-                     description: "禁用 SOCKS5 代理")
+                    ["-setwebproxystate", self.configuration.networkInterface, "off"],
+                    ["-setsecurewebproxystate", self.configuration.networkInterface, "off"],
+                    ["-setsocksfirewallproxystate", self.configuration.networkInterface, "off"]
                 ]
             }
             
             var allSuccess = true
-            var failedStep = ""
             
-            // 一次性执行所有命令
-            let result = self.executeCommands(commands)
-            
-            if !result.success {
-                allSuccess = false
-                failedStep = result.failedStep ?? "未知步骤"
-                
-                DispatchQueue.main.async {
-                    self.statusMessage = "❌ 执行失败: \(result.error ?? "未知错误")"
-                    self.isLoading = false
-                    self.configuration.isEnabled = false
+            if self.isHelperInstalled {
+                // 使用辅助脚本（无需密码）
+                for args in commands {
+                    if !self.executeWithHelper(args) {
+                        allSuccess = false
+                        break
+                    }
                 }
-                return
+            } else {
+                // 回退到 AppleScript（需要密码）
+                let result = self.executeCommandsWithAppleScript(commands)
+                allSuccess = result.success
             }
             
             DispatchQueue.main.async {
@@ -260,9 +281,46 @@ class ProxyManager: ObservableObject {
                         self.statusMessage = "✅ 代理已禁用"
                     }
                     self.saveConfiguration()
+                } else {
+                    self.statusMessage = "❌ 操作失败"
+                    self.configuration.isEnabled = false
                 }
             }
         }
+    }
+    
+    // 使用 AppleScript 执行命令（需要密码）
+    private func executeCommandsWithAppleScript(_ commands: [[String]]) -> (success: Bool, error: String?) {
+        var shellCommands: [String] = []
+        
+        for args in commands {
+            let escapedArgs = args.map { arg in
+                if arg.contains(" ") {
+                    return "'\(arg)'"
+                }
+                return arg
+            }
+            shellCommands.append("/usr/sbin/networksetup \(escapedArgs.joined(separator: " "))")
+        }
+        
+        let combinedScript = shellCommands.joined(separator: "; ")
+        let script = """
+        do shell script "\(escapeForAppleScript(combinedScript))" with administrator privileges
+        """
+        
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: script) {
+            scriptObject.executeAndReturnError(&error)
+            
+            if let error = error {
+                let errorCode = error["NSAppleScriptErrorNumber"] as? Int ?? 0
+                let errorMessage = error["NSAppleScriptErrorMessage"] as? String ?? "未知错误"
+                return (false, "错误 (\(errorCode)): \(errorMessage)")
+            }
+            return (true, nil)
+        }
+        
+        return (false, "无法创建 AppleScript")
     }
     
     func checkProxyStatus() {
@@ -352,7 +410,6 @@ class ProxyManager: ObservableObject {
         
         var proxyDict: [String: Any] = [:]
         
-        // 如果启用了 HTTP，使用 HTTP 代理测试
         if configuration.enabledTypes.contains(.http) {
             proxyDict = [
                 kCFNetworkProxiesHTTPEnable as String: 1,
@@ -412,6 +469,56 @@ struct ContentView: View {
             .padding(.horizontal)
             .padding(.top)
             
+            // 辅助工具状态
+            if !proxyManager.isHelperInstalled {
+                VStack(spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundColor(.blue)
+                        Text("安装辅助工具后，切换代理将不再需要输入密码")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    }
+                    
+                    Button(action: {
+                        proxyManager.installHelper()
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("安装辅助工具（仅需一次密码）")
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding()
+                .background(Color.blue.opacity(0.1))
+                .cornerRadius(10)
+                .padding(.horizontal)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                    Text("辅助工具已安装 - 可无密码切换代理")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                    
+                    Spacer()
+                    
+                    Button("卸载") {
+                        proxyManager.uninstallHelper()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.red)
+                    .font(.caption)
+                }
+                .padding()
+                .background(Color.green.opacity(0.1))
+                .cornerRadius(10)
+                .padding(.horizontal)
+            }
+            
             // 网络接口选择
             VStack(alignment: .leading, spacing: 8) {
                 Text("网络接口")
@@ -463,7 +570,6 @@ struct ContentView: View {
                 Text("代理服务器")
                     .font(.headline)
                 
-                // 主机地址
                 HStack {
                     Text("主机:")
                         .frame(width: 80, alignment: .leading)
@@ -472,7 +578,6 @@ struct ContentView: View {
                         .disabled(proxyManager.configuration.isEnabled)
                 }
                 
-                // HTTP 端口
                 if proxyManager.configuration.enabledTypes.contains(.http) {
                     HStack {
                         Text("HTTP 端口:")
@@ -485,7 +590,6 @@ struct ContentView: View {
                     }
                 }
                 
-                // HTTPS 端口
                 if proxyManager.configuration.enabledTypes.contains(.https) {
                     HStack {
                         Text("HTTPS 端口:")
@@ -498,7 +602,6 @@ struct ContentView: View {
                     }
                 }
                 
-                // SOCKS5 端口
                 if proxyManager.configuration.enabledTypes.contains(.socks5) {
                     HStack {
                         Text("SOCKS5 端口:")
@@ -524,7 +627,7 @@ struct ContentView: View {
                             .foregroundColor(.blue)
                     }
                     .buttonStyle(.plain)
-                    .help("这些地址将直接连接，不通过代理。防止代理软件自身进入死循环。")
+                    .help("这些地址将直接连接，不通过代理")
                 }
                 
                 TextEditor(text: $proxyManager.configuration.bypassDomains)
@@ -539,7 +642,7 @@ struct ContentView: View {
                         proxyManager.saveConfiguration()
                     }
                 
-                Text("多个地址用逗号分隔，支持通配符 (如 *.local) 和 CIDR (如 192.168.0.0/16)")
+                Text("多个地址用逗号分隔")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -556,7 +659,6 @@ struct ContentView: View {
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .lineLimit(3)
-                        .multilineTextAlignment(.leading)
                 }
                 
                 if proxyManager.isLoading {
@@ -564,7 +666,7 @@ struct ContentView: View {
                         .scaleEffect(0.8)
                 }
             }
-            .frame(minHeight: 60)
+            .frame(minHeight: 50)
             .padding(.horizontal)
             
             // 控制按钮
@@ -614,39 +716,9 @@ struct ContentView: View {
                 .disabled(!proxyManager.configuration.isEnabled || proxyManager.isLoading)
             }
             
-            Divider()
-                .padding(.horizontal)
-            
-            // 说明文本
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                    Text("首次启动需要输入管理员密码")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                }
-                .padding(.vertical, 6)
-                .padding(.horizontal, 10)
-                .background(Color.orange.opacity(0.15))
-                .cornerRadius(8)
-                
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.shield.fill")
-                        .foregroundColor(.green)
-                    Text("本地地址已自动绕过，避免代理软件死循环")
-                        .font(.caption)
-                }
-                .padding(.vertical, 6)
-                .padding(.horizontal, 10)
-                .background(Color.green.opacity(0.1))
-                .cornerRadius(8)
-            }
-            .padding(.horizontal)
-            
             Spacer()
         }
-        .frame(width: 480, height: 720)
+        .frame(width: 480, height: 780)
         .padding()
     }
 }
@@ -664,91 +736,38 @@ struct HelpView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HelpItem(
                     icon: "1.circle.fill",
-                    title: "启动代理服务器",
-                    description: "在启动此工具前,确保你的代理服务器(如 Clash、V2Ray 等)已经运行"
+                    title: "安装辅助工具（推荐）",
+                    description: "首次使用时点击安装辅助工具，输入一次密码后，以后切换代理将无需再输入密码"
                 )
                 
                 HelpItem(
                     icon: "2.circle.fill",
-                    title: "选择代理类型",
-                    description: "可以同时勾选 HTTP、HTTPS 和 SOCKS5，它们可以使用不同的端口"
+                    title: "启动代理服务器",
+                    description: "确保你的代理服务器(如 Clash、V2Ray 等)已经运行"
                 )
                 
                 HelpItem(
                     icon: "3.circle.fill",
                     title: "配置代理信息",
-                    description: "填写代理服务器的 IP 地址和各类型的端口号。例如：Clash 通常 HTTP/HTTPS 用 7890，SOCKS5 用 7891"
+                    description: "填写代理服务器的 IP 地址和端口号"
                 )
                 
                 HelpItem(
                     icon: "4.circle.fill",
-                    title: "选择网络接口",
-                    description: "Wi-Fi 用于无线连接,以太网用于有线连接"
-                )
-                
-                HelpItem(
-                    icon: "5.circle.fill",
-                    title: "输入管理员密码",
-                    description: "点击启动代理时会弹出密码对话框,输入你的 Mac 登录密码"
-                )
-                
-                HelpItem(
-                    icon: "checkmark.circle.fill",
-                    title: "测试连接",
-                    description: "启动代理后,可以点击测试连接按钮验证代理是否正常工作"
+                    title: "启动/停止代理",
+                    description: "如已安装辅助工具，切换将立即生效；否则需要输入密码"
                 )
             }
             
             Divider()
             
-            Text("常见配置")
+            Text("安全说明")
                 .font(.headline)
             
-            Text("• Clash: HTTP/HTTPS 端口 7890，SOCKS5 端口 7891")
+            Text("辅助工具安装在 /usr/local/bin/ 目录，仅用于执行 networksetup 命令。你可以随时点击 '卸载'按钮移除它。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            
-            Text("• V2Ray: 通常使用 SOCKS5，端口 1080")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Text("• Shadowrocket: 根据配置，通常 HTTP 1087，SOCKS5 1086")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Divider()
-            
-            Text("绕过列表说明")
-                .font(.headline)
-            
-            Text("• 默认已包含本地地址，防止代理软件死循环")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Text("• 如需添加其他地址，用逗号分隔")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Text("• 例如：127.0.0.1, localhost, *.apple.com, 192.168.0.0/16")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Divider()
-            
-            Text("常见问题")
-                .font(.headline)
-            
-            Text("• 如果没有弹出密码框,请检查系统设置中的辅助功能权限")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Text("• 如果代理无法使用,请确认代理服务器地址和端口正确")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Text("• 停止使用时记得关闭代理,否则可能无法正常上网")
-                .font(.caption)
-                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding()
         .frame(width: 420)
